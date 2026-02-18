@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -21,154 +20,150 @@ type EventSource interface {
 	Close() error
 }
 
-// BdActivitySource reads events from bd activity --follow
+// bdIssue represents an issue from bd list --json output.
+type bdIssue struct {
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Status    string `json:"status"`
+	Priority  int    `json:"priority"`
+	Type      string `json:"issue_type"`
+	Assignee  string `json:"assignee"`
+	CreatedBy string `json:"created_by"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// BdActivitySource polls bd list for issue changes and emits events.
+// This replaces the original implementation that depended on the
+// nonexistent "bd activity" command.
 type BdActivitySource struct {
-	cmd     *exec.Cmd
 	events  chan Event
 	cancel  context.CancelFunc
 	workDir string
 }
 
-// NewBdActivitySource creates a new source that tails bd activity
+// NewBdActivitySource creates a source that polls bd list for issue changes.
 func NewBdActivitySource(workDir string) (*BdActivitySource, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	cmd := exec.CommandContext(ctx, "bd", "activity", "--follow")
-	cmd.Dir = workDir
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return nil, err
-	}
-
 	source := &BdActivitySource{
-		cmd:     cmd,
 		events:  make(chan Event, 100),
 		cancel:  cancel,
 		workDir: workDir,
 	}
 
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if event := parseBdActivityLine(line); event != nil {
-				select {
-				case source.events <- *event:
-				default:
-					// Drop event if channel full
-				}
-			}
-		}
-		close(source.events)
-	}()
+	go source.poll(ctx)
 
 	return source, nil
 }
 
-// Events returns the event channel
+// Events returns the event channel.
 func (s *BdActivitySource) Events() <-chan Event {
 	return s.events
 }
 
-// Close stops the source
+// Close stops the polling source.
 func (s *BdActivitySource) Close() error {
 	s.cancel()
-	return s.cmd.Wait()
+	return nil
 }
 
-// bd activity line pattern: [HH:MM:SS] SYMBOL BEAD_ID action · description
-var bdActivityPattern = regexp.MustCompile(`^\[(\d{2}:\d{2}:\d{2})\]\s+([+→✓✗⊘📌])\s+(\S+)?\s*(\w+)?\s*·?\s*(.*)$`)
+func (s *BdActivitySource) poll(ctx context.Context) {
+	defer close(s.events)
 
-// parseBdActivityLine parses a line from bd activity output
-func parseBdActivityLine(line string) *Event {
-	matches := bdActivityPattern.FindStringSubmatch(line)
-	if matches == nil {
-		// Try simpler pattern
-		return parseSimpleLine(line)
-	}
+	known := make(map[string]string) // id → updated_at
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
 
-	timeStr := matches[1]
-	symbol := matches[2]
-	beadID := matches[3]
-	action := matches[4]
-	message := matches[5]
+	// Seed with current state without emitting events
+	s.fetchIssues(ctx, known, true)
 
-	// Parse time (assume today)
-	now := time.Now()
-	t, err := time.Parse("15:04:05", timeStr)
-	if err != nil {
-		t = now
-	} else {
-		t = time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), t.Second(), 0, now.Location())
-	}
-
-	// Map symbol to event type
-	eventType := "update"
-	switch symbol {
-	case "+":
-		eventType = "create"
-	case "→":
-		eventType = "update"
-	case "✓":
-		eventType = "complete"
-	case "✗":
-		eventType = "fail"
-	case "⊘":
-		eventType = "delete"
-	case "📌":
-		eventType = "pin"
-	}
-
-	// Try to extract actor and rig from bead ID
-	actor, rig, role := parseBeadContext(beadID)
-
-	return &Event{
-		Time:    t,
-		Type:    eventType,
-		Actor:   actor,
-		Target:  beadID,
-		Message: strings.TrimSpace(action + " " + message),
-		Rig:     rig,
-		Role:    role,
-		Raw:     line,
-	}
-}
-
-// parseSimpleLine handles lines that don't match the full pattern
-func parseSimpleLine(line string) *Event {
-	if strings.TrimSpace(line) == "" {
-		return nil
-	}
-
-	// Try to extract timestamp
-	var t time.Time
-	if len(line) > 10 && line[0] == '[' {
-		if idx := strings.Index(line, "]"); idx > 0 {
-			timeStr := line[1:idx]
-			now := time.Now()
-			if parsed, err := time.Parse("15:04:05", timeStr); err == nil {
-				t = time.Date(now.Year(), now.Month(), now.Day(),
-					parsed.Hour(), parsed.Minute(), parsed.Second(), 0, now.Location())
-			}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.fetchIssues(ctx, known, false)
 		}
 	}
+}
 
-	if t.IsZero() {
+func (s *BdActivitySource) fetchIssues(
+	ctx context.Context,
+	known map[string]string,
+	initial bool,
+) {
+	cmd := exec.CommandContext(ctx, "bd", "list",
+		"--json", "--sort", "updated", "--reverse",
+		"--all", "--limit", "50")
+	cmd.Dir = s.workDir
+
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+
+	var issues []bdIssue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return
+	}
+
+	for _, issue := range issues {
+		prevUpdated, seen := known[issue.ID]
+		known[issue.ID] = issue.UpdatedAt
+
+		if initial {
+			continue
+		}
+
+		if !seen {
+			s.emitEvent(ctx, issueToEvent(issue, "create"))
+		} else if prevUpdated != issue.UpdatedAt {
+			eventType := "update"
+			if issue.Status == "closed" {
+				eventType = "complete"
+			}
+			s.emitEvent(ctx, issueToEvent(issue, eventType))
+		}
+	}
+}
+
+func (s *BdActivitySource) emitEvent(ctx context.Context, event Event) {
+	select {
+	case s.events <- event:
+	case <-ctx.Done():
+	}
+}
+
+func issueToEvent(issue bdIssue, eventType string) Event {
+	t, err := time.Parse(time.RFC3339, issue.UpdatedAt)
+	if err != nil {
 		t = time.Now()
 	}
 
-	return &Event{
+	actor, rig, role := parseBeadContext(issue.ID)
+	if actor == "" {
+		actor = issue.CreatedBy
+	}
+
+	var message string
+	switch eventType {
+	case "create":
+		message = "created: " + issue.Title
+	case "complete":
+		message = "closed: " + issue.Title
+	default:
+		message = "updated: " + issue.Title
+	}
+
+	return Event{
 		Time:    t,
-		Type:    "update",
-		Message: line,
-		Raw:     line,
+		Type:    eventType,
+		Actor:   actor,
+		Target:  issue.ID,
+		Message: message,
+		Rig:     rig,
+		Role:    role,
 	}
 }
 
@@ -506,64 +501,6 @@ func getPayloadInt(payload map[string]interface{}, key string) int {
 		return int(v)
 	}
 	return 0
-}
-
-// CombinedSource merges events from multiple sources
-type CombinedSource struct {
-	sources []EventSource
-	events  chan Event
-	cancel  context.CancelFunc
-}
-
-// NewCombinedSource creates a source that merges multiple event sources
-func NewCombinedSource(sources ...EventSource) *CombinedSource {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	combined := &CombinedSource{
-		sources: sources,
-		events:  make(chan Event, 100),
-		cancel:  cancel,
-	}
-
-	// Fan-in from all sources
-	for _, src := range sources {
-		go func(s EventSource) {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case event, ok := <-s.Events():
-					if !ok {
-						return
-					}
-					select {
-					case combined.events <- event:
-					default:
-						// Drop if full
-					}
-				}
-			}
-		}(src)
-	}
-
-	return combined
-}
-
-// Events returns the combined event channel
-func (c *CombinedSource) Events() <-chan Event {
-	return c.events
-}
-
-// Close stops all sources
-func (c *CombinedSource) Close() error {
-	c.cancel()
-	var lastErr error
-	for _, src := range c.sources {
-		if err := src.Close(); err != nil {
-			lastErr = err
-		}
-	}
-	return lastErr
 }
 
 // FindBeadsDir finds the beads directory for the given working directory

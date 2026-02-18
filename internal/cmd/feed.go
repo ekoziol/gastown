@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
@@ -38,7 +39,7 @@ func init() {
 	feedCmd.Flags().StringVar(&feedType, "type", "", "Filter by event type (create, update, delete, comment)")
 	feedCmd.Flags().StringVar(&feedRig, "rig", "", "Run from specific rig's beads directory")
 	feedCmd.Flags().BoolVarP(&feedWindow, "window", "w", false, "Open in dedicated tmux window (creates 'feed' window)")
-	feedCmd.Flags().BoolVar(&feedPlain, "plain", false, "Use plain text output (bd activity) instead of TUI")
+	feedCmd.Flags().BoolVar(&feedPlain, "plain", false, "Use plain text output (bd list) instead of TUI")
 }
 
 var feedCmd = &cobra.Command{
@@ -54,11 +55,11 @@ By default, launches an interactive TUI dashboard with:
   - Vim-style navigation: j/k to scroll, tab to switch panels, 1/2/3 for panels, q to quit
 
 The feed combines multiple event sources:
-  - Beads activity: Issue creates, updates, completions (from bd activity)
+  - Beads activity: Issue creates, updates, completions (polls bd list)
   - GT events: Agent activity like patrol, sling, handoff (from .events.jsonl)
   - Convoy status: In-progress and recently-landed convoys (refreshes every 10s)
 
-Use --plain for simple text output (wraps bd activity only).
+Use --plain for simple text output (wraps bd list only).
 
 Tmux Integration:
   Use --window to open the feed in a dedicated tmux window named 'feed'.
@@ -83,7 +84,7 @@ MQ (Merge Queue) event symbols:
 
 Examples:
   gt feed                       # Launch TUI dashboard
-  gt feed --plain               # Plain text output (bd activity)
+  gt feed --plain               # Plain text output (bd list)
   gt feed --window              # Open in dedicated tmux window
   gt feed --since 1h            # Events from last hour
   gt feed --rig greenplace         # Use gastown rig's beads`,
@@ -125,7 +126,7 @@ func runFeed(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Build bd activity command (without argv[0] for buildFeedCommand)
+	// Build bd list command args
 	bdArgs := buildFeedArgs()
 
 	// Handle --window mode: open in dedicated tmux window
@@ -140,22 +141,22 @@ func runFeed(cmd *cobra.Command, args []string) error {
 		return runFeedTUI(workDir)
 	}
 
-	// Plain mode: exec bd activity directly
+	// Plain mode: exec bd list directly
 	return runFeedDirect(workDir, bdArgs)
 }
 
-// buildFeedArgs builds the bd activity arguments based on flags.
+// buildFeedArgs builds the bd list arguments based on flags.
 func buildFeedArgs() []string {
-	var args []string
+	args := []string{"--sort", "updated", "--reverse", "--all"}
 
-	// Default to follow mode unless --no-follow set
+	// Default to watch mode unless --no-follow set
 	shouldFollow := !feedNoFollow
 	if feedFollow {
 		shouldFollow = true
 	}
 
 	if shouldFollow {
-		args = append(args, "--follow")
+		args = append(args, "--watch")
 	}
 
 	if feedLimit != 100 {
@@ -163,11 +164,15 @@ func buildFeedArgs() []string {
 	}
 
 	if feedSince != "" {
-		args = append(args, "--since", feedSince)
+		dur, err := time.ParseDuration(feedSince)
+		if err == nil {
+			cutoff := time.Now().Add(-dur).UTC().Format(time.RFC3339)
+			args = append(args, "--updated-after", cutoff)
+		}
 	}
 
 	if feedMol != "" {
-		args = append(args, "--mol", feedMol)
+		args = append(args, "--id", feedMol)
 	}
 
 	if feedType != "" {
@@ -177,7 +182,7 @@ func buildFeedArgs() []string {
 	return args
 }
 
-// runFeedDirect runs bd activity in the current terminal.
+// runFeedDirect runs bd list in the current terminal.
 func runFeedDirect(workDir string, bdArgs []string) error {
 	bdPath, err := exec.LookPath("bd")
 	if err != nil {
@@ -185,7 +190,7 @@ func runFeedDirect(workDir string, bdArgs []string) error {
 	}
 
 	// Prepend argv[0] for exec
-	fullArgs := append([]string{"bd", "activity"}, bdArgs...)
+	fullArgs := append([]string{"bd", "list"}, bdArgs...)
 
 	// Change to the target directory before exec
 	if err := os.Chdir(workDir); err != nil {
@@ -205,10 +210,10 @@ func runFeedTUI(workDir string) error {
 
 	var sources []feed.EventSource
 
-	// Create event source from bd activity
+	// Create event source from bd list polling
 	bdSource, err := feed.NewBdActivitySource(workDir)
 	if err != nil {
-		return fmt.Errorf("creating bd activity source: %w", err)
+		return fmt.Errorf("creating bd list source: %w", err)
 	}
 	sources = append(sources, bdSource)
 
@@ -265,20 +270,20 @@ func runFeedInWindow(workDir string, bdArgs []string) error {
 	}
 
 	// Build the command to run in the window
-	// Always use follow mode in window (it's meant to be persistent)
-	feedCmd := fmt.Sprintf("cd %s && bd activity --follow", workDir)
-	if len(bdArgs) > 0 {
-		// Filter out --follow if present (we add it unconditionally)
-		var filteredArgs []string
-		for _, arg := range bdArgs {
-			if arg != "--follow" {
-				filteredArgs = append(filteredArgs, arg)
-			}
-		}
-		if len(filteredArgs) > 0 {
-			feedCmd = fmt.Sprintf("cd %s && bd activity --follow %s", workDir, strings.Join(filteredArgs, " "))
+	// Always use watch mode in window (it's meant to be persistent)
+	// Ensure --watch is present in args
+	hasWatch := false
+	for _, arg := range bdArgs {
+		if arg == "--watch" {
+			hasWatch = true
+			break
 		}
 	}
+	if !hasWatch {
+		bdArgs = append(bdArgs, "--watch")
+	}
+
+	feedCmd := fmt.Sprintf("cd %s && bd list %s", workDir, strings.Join(bdArgs, " "))
 
 	// Check if 'feed' window already exists
 	windowTarget := sessionName + ":feed"
@@ -293,7 +298,7 @@ func runFeedInWindow(workDir string, bdArgs []string) error {
 		return selectWindow(t, windowTarget)
 	}
 
-	// Create new window named 'feed' with the bd activity command
+	// Create new window named 'feed' with the bd list command
 	fmt.Printf("Creating feed window in session %s...\n", sessionName)
 	if err := createWindow(t, sessionName, "feed", workDir, feedCmd); err != nil {
 		return fmt.Errorf("creating feed window: %w", err)

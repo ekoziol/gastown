@@ -31,7 +31,7 @@ import (
 
 // Daemon is the town-level background service.
 // It ensures patrol agents (Deacon, Witnesses) are running and detects failures.
-// This is recovery-focused: normal wake is handled by feed subscription (bd activity --follow).
+// This is recovery-focused: normal wake is handled by feed subscription (beads file watch).
 // The daemon is the safety net for dead sessions, GUPP violations, and orphaned work.
 type Daemon struct {
 	config  *Config
@@ -110,7 +110,7 @@ func (d *Daemon) Run() error {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1)
 
 	// Fixed recovery-focused heartbeat (no activity-based backoff)
-	// Normal wake is handled by feed subscription (bd activity --follow)
+	// Normal wake is handled by feed subscription (beads file watch)
 	timer := time.NewTimer(recoveryHeartbeatInterval)
 	defer timer.Stop()
 
@@ -153,14 +153,14 @@ func (d *Daemon) Run() error {
 }
 
 // recoveryHeartbeatInterval is the fixed interval for recovery-focused daemon.
-// Normal wake is handled by feed subscription (bd activity --follow).
+// Normal wake is handled by feed subscription (beads file watch).
 // The daemon is a safety net for dead sessions, GUPP violations, and orphaned work.
 // 3 minutes is fast enough to detect stuck agents promptly while avoiding excessive overhead.
 const recoveryHeartbeatInterval = 3 * time.Minute
 
 // heartbeat performs one heartbeat cycle.
 // The daemon is recovery-focused: it ensures agents are running and detects failures.
-// Normal wake is handled by feed subscription (bd activity --follow).
+// Normal wake is handled by feed subscription (beads file watch).
 // The daemon is the safety net for edge cases:
 // - Dead sessions that need restart
 // - Agents with work-on-hook not progressing (GUPP violation)
