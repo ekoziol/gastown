@@ -1,12 +1,12 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -28,9 +28,9 @@ var moleculeAwaitSignalCmd = &cobra.Command{
 	Short: "Wait for activity feed signal with timeout",
 	Long: `Wait for any activity on the beads feed, with optional backoff.
 
-This command is the primary wake mechanism for patrol agents. It subscribes
-to 'bd activity --follow' and returns immediately when any line of output
-is received (indicating beads activity).
+This command is the primary wake mechanism for patrol agents. It watches
+beads files for changes and returns immediately when a modification is
+detected (indicating beads activity).
 
 If no activity occurs within the timeout, the command returns with exit code 0
 but sets the AWAIT_SIGNAL_REASON environment variable to "timeout".
@@ -137,7 +137,7 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 
 	startTime := time.Now()
 
-	// Start bd activity --follow
+	// Watch for beads file changes
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -234,61 +234,56 @@ func calculateEffectiveTimeout(idleCycles int) (time.Duration, error) {
 	return time.ParseDuration(awaitSignalTimeout)
 }
 
-// waitForActivitySignal starts bd activity --follow and waits for any output.
-// Returns immediately when a line is received, or when context is canceled.
+// waitForActivitySignal polls beads files for changes.
+// Returns immediately when a change is detected, or when context is canceled.
 func waitForActivitySignal(ctx context.Context, workDir string) (*AwaitSignalResult, error) {
-	// Start bd activity --follow
-	cmd := exec.CommandContext(ctx, "bd", "activity", "--follow")
-	cmd.Dir = workDir
+	beadsDir := beads.ResolveBeadsDir(workDir)
 
-	stdout, err := cmd.StdoutPipe()
+	// Find a file to watch for changes
+	watchFile, initialMod, err := findWatchTarget(beadsDir)
 	if err != nil {
-		return nil, fmt.Errorf("creating stdout pipe: %w", err)
+		return nil, fmt.Errorf("no beads files to watch in %s: %w", beadsDir, err)
 	}
 
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("starting bd activity: %w", err)
-	}
+	// Poll for changes
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
-	// Channel for results
-	signalCh := make(chan string, 1)
-	errCh := make(chan error, 1)
-
-	// Read lines in goroutine
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		if scanner.Scan() {
-			// Got a line - this is our signal
-			signalCh <- scanner.Text()
-		} else if err := scanner.Err(); err != nil {
-			errCh <- err
+	for {
+		select {
+		case <-ctx.Done():
+			return &AwaitSignalResult{
+				Reason: "timeout",
+			}, nil
+		case <-ticker.C:
+			info, err := os.Stat(watchFile)
+			if err != nil {
+				continue
+			}
+			if info.ModTime().After(initialMod) {
+				return &AwaitSignalResult{
+					Reason: "signal",
+					Signal: "beads changed: " + filepath.Base(watchFile),
+				}, nil
+			}
 		}
-	}()
-
-	// Wait for signal, error, or timeout
-	select {
-	case signal := <-signalCh:
-		// Got activity signal - kill the process and return
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return &AwaitSignalResult{
-			Reason: "signal",
-			Signal: signal,
-		}, nil
-
-	case err := <-errCh:
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return nil, fmt.Errorf("reading from feed: %w", err)
-
-	case <-ctx.Done():
-		// Timeout - kill process and return timeout result
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return &AwaitSignalResult{
-			Reason: "timeout",
-		}, nil
 	}
+}
+
+// findWatchTarget returns the best file to watch for beads changes
+// and its current modification time.
+func findWatchTarget(beadsDir string) (string, time.Time, error) {
+	candidates := []string{
+		filepath.Join(beadsDir, "last-touched"),
+		filepath.Join(beadsDir, "issues.jsonl"),
+	}
+	for _, path := range candidates {
+		info, err := os.Stat(path)
+		if err == nil {
+			return path, info.ModTime(), nil
+		}
+	}
+	return "", time.Time{}, fmt.Errorf("no watch targets found")
 }
 
 // GetCurrentStepBackoff retrieves backoff config from the current step.
